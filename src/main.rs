@@ -11,6 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::error::Error;
 
+// For RedBlue edits
+use std::io::BufWriter;
+use std::fs::File;
+use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 const EXITCODE_SUCCESS : i32 = 0;
 const EXITCODE_CPULOADFAILS : i32 = 2;
 
@@ -24,6 +30,7 @@ enum GBEvent {
     KeyDown(rboy::KeypadKey),
     SpeedUp,
     SpeedDown,
+    Screencap,
 }
 
 fn main() {
@@ -132,6 +139,8 @@ fn real_main() -> i32 {
                     WindowEvent::CloseRequested
                         => stop = true,
                     WindowEvent::KeyboardInput { input, .. } => match input {
+                        KeyboardInput { state: Pressed, virtual_keycode: Some(VirtualKeyCode::P), .. }
+                            => {let _ = sender1.send(GBEvent::Screencap); },
                         KeyboardInput { state: Pressed, virtual_keycode: Some(VirtualKeyCode::Escape), .. }
                             => stop = true,
                         KeyboardInput { state: Pressed, virtual_keycode: Some(VirtualKeyCode::Key1), .. }
@@ -267,8 +276,12 @@ fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver
     let periodic = timer_periodic(16);
     let mut limit_speed = true;
 
-    let waitticks = (4194304f64 / 1000.0 * 16.0).round() as u32;
+    // RedBlue: this neds to probably not be hardcoded.
+    let waitticks = (4194304f64 / 1000.0 * 19.0).round() as u32;
     let mut ticks = 0;
+
+    let (sender1, receiver1) = mpsc::channel();
+    std::thread::spawn(move || wait_n_process_screencaps(receiver1));
 
     'outer: loop {
         while ticks < waitticks {
@@ -291,6 +304,11 @@ fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver
                         GBEvent::KeyDown(key) => cpu.keydown(key),
                         GBEvent::SpeedUp => limit_speed = false,
                         GBEvent::SpeedDown => { limit_speed = true; cpu.sync_audio(); }
+                        GBEvent::Screencap => { 
+                            // Have to clone as the original slice goes out of scope
+                            let mut v = vec![0; 160 * 144 * 3];
+                            v.clone_from_slice(cpu.get_gpu_data()); 
+                            let _ = sender1.send(v); }
                     }
                 },
                 Err(TryRecvError::Empty) => break 'recv,
@@ -301,6 +319,124 @@ fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver
         if limit_speed { let _ = periodic.recv(); }
     }
 }
+
+
+/* 
+* REDBLUE EDITS
+*/
+
+// Could be byte-by-byte AND with shifts but... trying this instead.
+// If the "no unsafe code" metric is desired, just replace.
+fn u32_to_bytes(input: u32) -> [u8; 4] {
+	return unsafe { std::mem::transmute(input) };
+}
+
+// Writes the GPU screen data to a bitmap in the same working directory with a time-based
+// name.
+//
+// TODO: add scaling support
+fn write_bitmap(bmp: &[u8]) -> bool {
+    // Lovely Stack Overflow code
+    // https://stackoverflow.com/questions/26593387/how-can-i-get-the-current-time-in-milliseconds
+    let start = SystemTime::now();
+    let since_the_epoch = start.duration_since(UNIX_EPOCH)
+        .expect("Time went backwards");
+    let in_ms = since_the_epoch.as_secs() as u128 * 1000 + 
+            since_the_epoch.subsec_millis() as u128;
+            
+    let filename = format!("screencap_{}.bmp", in_ms);
+	let mut buff: BufWriter<File> = BufWriter::new(File::create(filename)
+        .expect("Could not open file for write_bitmap"));
+	let size: u32 = bmp.len() as u32;
+
+	// Magic numbers
+	let header1: [u8; 2]  = [0x42, 0x4d]; 
+	buff.write(&header1[..]).expect("could not write data for write_bitmap()");
+
+	// File size, plus 54-bit header
+	let write_value = u32_to_bytes(size + 54);
+	buff.write(&write_value[..]).expect("could not write data for write_bitmap()");
+
+	// Additional flags, including offset until data section
+	let header2: [u8; 12] = [
+        0x00, 0x00, 0x00, 0x00,	// Four reserved bytes
+		0x36, 0x00, 0x00, 0x00, // Offset where data is found
+		0x28, 0x00, 0x00, 0x00	// Number of following bytes
+		];
+	buff.write(&header2[..]).expect("could not write data for write_bitmap()");
+
+	// Dimensions (hardcoded by their known from GB/GBC specifications)
+	let write_value = [0xA0, 0, 0, 0];
+	buff.write(&write_value[..]).expect("could not write data for write_bitmap()");		// 4-byte width
+	
+	let write_value = [0x90, 0, 0, 0];
+	buff.write(&write_value[..]).expect("could not write data for write_bitmap()");		// 4-byte height
+
+	// Color planes, color density, additional unused flags
+	let header3: [u8; 8] = [
+		0x01, 0x00, 			// Number of planes
+		0x18, 0x00, 			// Bits per pixel
+		0x00, 0x00, 0x00, 0x00  // No compression
+		];
+	buff.write(&header3[..]).expect("could not write data for write_bitmap()");
+
+	// Write the size of the data portion, include potential row padding
+	let write_value = u32_to_bytes(size);
+	buff.write(&write_value[..]).expect("could not write data for write_bitmap()");
+
+	let header4: [u8; 16] = [
+		0x00, 0x00, 0x00, 0x00, // Print resolution (not used)
+		0x00, 0x00, 0x00, 0x00, // Print resolution (not used)
+		0x00, 0x00, 0x00, 0x00, // Number of colors in pallette (not used)
+		0x00, 0x00, 0x00, 0x00	// Important colors (not used)
+		];
+	buff.write(&header4[..]).expect("could not write data for write_bitmap()");
+
+	// Write data
+	buff.write(&bmp[..]).expect("could not write data for write_bitmap()");
+
+	return true;
+}
+
+// GPU Data is upside-down. Function exists to reverse it.
+//
+// TODO: add scaling
+fn y_invert_bitmap(data: Vec<u8>) -> Vec<u8> {
+    let row_size: usize = 160 * 3; // screen_width * bytes_per_pixel
+    let max_size: usize = 144 * row_size; // screen_height * row_size
+    let mut ret: Vec<u8> = vec![0; max_size];
+
+    for row in 0..144/2 {
+        let a_index: usize = row * row_size;
+        let b_index: usize = max_size - (row * row_size) - row_size;
+
+        for col in 0..row_size {
+            ret[a_index + col] = data[b_index + col];
+            ret[b_index + col] = data[a_index + col];
+        }
+    }
+
+    return ret;
+}
+
+// Rather than holding up the main thread for screencaps, pass the
+// image buffer to a channel and let another listener handle it
+fn wait_n_process_screencaps(receiver: Receiver<Vec<u8>>) {
+    loop {
+        match receiver.try_recv() {
+            Ok(data) => {
+                let t = y_invert_bitmap(data);
+                write_bitmap(&t[..]);
+            },
+            Err(TryRecvError::Empty) => (),
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+/* 
+* END REDBLUE EDITS
+*/
 
 fn timer_periodic(ms: u64) -> Receiver<()> {
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
