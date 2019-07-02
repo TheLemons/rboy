@@ -1,7 +1,7 @@
 use blip_buf::BlipBuf;
 
 const WAVE_PATTERN : [[i32; 8]; 4] = [[-1,-1,-1,-1,1,-1,-1,-1],[-1,-1,-1,-1,1,1,-1,-1],[-1,-1,1,1,1,1,-1,-1],[1,1,1,1,-1,-1,1,1]];
-const CLOCKS_PER_SECOND : u32 = 1 << 22;
+const CLOCKS_PER_SECOND : u32 = 4194304;//1 << 22;
 const OUTPUT_SAMPLE_COUNT : usize = 2000; // this should be less than blip_buf::MAX_FRAME
 
 pub trait AudioPlayer : Send {

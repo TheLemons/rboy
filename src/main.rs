@@ -72,6 +72,18 @@ fn real_main() -> i32 {
                      Ok(..) => Ok(()),
                  })
              .takes_value(true))
+        .arg(clap::Arg::with_name("volume")
+            .help("Sets the volume (1-10) of the emulator")
+            .short("v")
+            .long("volume")
+            .validator(|s|
+                match s.parse::<u32>() {
+                    Err(e) => Err(format!("Could not parse volume: {}", e.description())),
+                    Ok(s) if s < 1 => Err("Volume must be atleast 1".to_owned()),
+                    Ok(s) if s > 10 => Err("Volume must be at most 10".to_owned()),
+                    Ok(..) => Ok(()),
+                })
+            .takes_value(true))
         .arg(clap::Arg::with_name("audio")
              .help("Enables audio")
              .short("a")
@@ -88,6 +100,7 @@ fn real_main() -> i32 {
     let opt_skip_checksum = matches.is_present("skip-checksum");
     let filename = matches.value_of("filename").unwrap();
     let scale = matches.value_of("scale").unwrap_or("2").parse::<u32>().unwrap();
+    let volume = matches.value_of("volume").unwrap_or("4").parse::<u32>().unwrap();
 
     let cpu = construct_cpu(filename, opt_classic, opt_serial, opt_printer, opt_skip_checksum);
     if cpu.is_none() { return EXITCODE_CPULOADFAILS; }
@@ -95,7 +108,7 @@ fn real_main() -> i32 {
     if opt_audio {
         let player = CpalPlayer::get();
         match player {
-            Some(v) => cpu.enable_audio(Box::new(v) as Box<rboy::AudioPlayer>),
+            Some(mut v) => {v.set_volume(volume as f32); cpu.enable_audio(Box::new(v) as Box<rboy::AudioPlayer>)},
             None => { warn("Could not open audio device"); return EXITCODE_CPULOADFAILS; },
         }
     }
@@ -277,7 +290,7 @@ fn run_cpu(mut cpu: Box<Device>, sender: SyncSender<Vec<u8>>, receiver: Receiver
     let mut limit_speed = true;
 
     // RedBlue: this neds to probably not be hardcoded.
-    let waitticks = (4194304f64 / 1000.0 * 19.0).round() as u32;
+    let waitticks = (4194304f64 / 1000.0 * 16.00).round() as u32;
     let mut ticks = 0;
 
     let (sender1, receiver1) = mpsc::channel();
@@ -392,7 +405,7 @@ fn write_bitmap(bmp: &[u8]) -> bool {
 		];
 	buff.write(&header4[..]).expect("could not write data for write_bitmap()");
 
-	// Write data
+	// Write image data
 	buff.write(&bmp[..]).expect("could not write data for write_bitmap()");
 
 	return true;
@@ -465,6 +478,7 @@ fn set_window_size(window: &glium::glutin::Window, scale: u32) {
 struct CpalPlayer {
     buffer: Arc<Mutex<Vec<(f32, f32)>>>,
     sample_rate: u32,
+    volume: f32,
 }
 
 impl CpalPlayer {
@@ -512,11 +526,21 @@ impl CpalPlayer {
         let player = CpalPlayer {
             buffer: shared_buffer.clone(),
             sample_rate: wanted_samplerate.unwrap().0,
+            volume: 1.0,
         };
 
         thread::spawn(move|| cpal_thread(event_loop, shared_buffer));
 
         Some(player)
+    }
+
+    // Yes, odd. It's inverted. The larger the number, the larger the divisor in play(). 
+    fn set_volume(&mut self, new_vol: f32) -> bool {
+        if new_vol < 1.0 || new_vol > 10.0 {return false;}
+        else {
+            self.volume = 11.0 - new_vol;
+            return true;
+        }
     }
 }
 
@@ -564,7 +588,7 @@ impl rboy::AudioPlayer for CpalPlayer {
                 // This speeds up the resync after the turning on and off the speed limiter
                 return
             }
-            buffer.push((*l, *r));
+            buffer.push((*l / self.volume, *r / self.volume));
         }
     }
 
